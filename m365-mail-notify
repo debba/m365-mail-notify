@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""m365-mail-notify - GNOME desktop notifications for new Microsoft 365 email.
+
+It never downloads or stores mail: it only reads sender and subject of new
+messages and shows them as a GNOME notification. Clicking the notification
+opens Outlook on the web.
+
+Backends:
+  imap   IMAP IDLE with XOAUTH2 on outlook.office365.com (instant, default)
+  graph  Microsoft Graph polling every N seconds (if the tenant disabled IMAP)
+
+Commands:
+  m365-mail-notify login [--backend imap|graph] [--user EMAIL] [--client-id ID] [--tenant TENANT]
+  m365-mail-notify run            # started by the systemd user service
+  m365-mail-notify test           # show a test notification
+  m365-mail-notify logout
+"""
+import argparse
+import base64
+import email.header
+import email.utils
+import imaplib
+import json
+import os
+import re
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+import gi
+
+gi.require_version("Notify", "0.7")
+from gi.repository import GLib, Notify  # noqa: E402
+
+APP = "m365-mail-notify"
+CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+CONF = CONF_DIR / "config.json"
+OUTLOOK_URL = "https://outlook.office.com/mail/"
+AUTHORITY = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
+IMAP_HOST = "outlook.office365.com"
+GRAPH_INBOX = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+
+# Fallback public client IDs (no secret involved) used when no --client-id is given:
+# Thunderbird for IMAP, Microsoft Graph PowerShell for Graph. The Microsoft sign-in page
+# shows the name of the application that owns the client ID, so register your own app
+# (see README) if you want it to appear under its own name.
+BACKENDS = {
+    "imap": {
+        "client_id": "08162f7c-0fd2-4200-a84a-f25a4db0b584",
+        "scope": "https://outlook.office.com/IMAP.AccessAsUser.All offline_access openid email",
+    },
+    "graph": {
+        "client_id": "14d82eec-204b-4c2f-b7e8-296a70dab67e",
+        "scope": "https://graph.microsoft.com/Mail.Read offline_access openid email",
+    },
+}
+
+
+def log(msg):
+    print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- config / secrets
+
+def load_config():
+    if CONF.exists():
+        return json.loads(CONF.read_text())
+    return {}
+
+
+def save_config(cfg):
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    CONF.write_text(json.dumps(cfg, indent=2))
+
+
+def secret_store(key, value):
+    subprocess.run(
+        ["secret-tool", "store", "--label", f"{APP} {key}", "application", APP, "key", key],
+        input=value.encode(), check=True,
+    )
+
+
+def secret_lookup(key):
+    r = subprocess.run(["secret-tool", "lookup", "application", APP, "key", key], capture_output=True)
+    return r.stdout.decode() if r.returncode == 0 and r.stdout else None
+
+
+def secret_clear(key):
+    subprocess.run(["secret-tool", "clear", "application", APP, "key", key])
+
+
+# ---------------------------------------------------------------- OAuth2
+
+class Auth:
+    def __init__(self, backend, client_id=None, tenant="common"):
+        self.backend = backend
+        self.client_id = client_id or BACKENDS[backend]["client_id"]
+        self.scope = BACKENDS[backend]["scope"]
+        self.authority = AUTHORITY.format(tenant=tenant or "common")
+        self._lock = threading.Lock()
+
+    def _save(self, tok):
+        data = {
+            "access_token": tok["access_token"],
+            "refresh_token": tok.get("refresh_token"),
+            "expires_at": time.time() + int(tok.get("expires_in", 3600)),
+        }
+        secret_store("tokens", json.dumps(data))
+        return data
+
+    def _load(self):
+        raw = secret_lookup("tokens")
+        return json.loads(raw) if raw else None
+
+    def has_tokens(self):
+        return self._load() is not None
+
+    def device_login(self):
+        r = requests.post(f"{self.authority}/devicecode",
+                          data={"client_id": self.client_id, "scope": self.scope}, timeout=30).json()
+        if "device_code" not in r:
+            raise SystemExit(f"Could not start login: {r.get('error_description', r)}")
+        print("\n" + r["message"] + "\n")
+        subprocess.Popen(["xdg-open", r["verification_uri"]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        interval = int(r.get("interval", 5))
+        while True:
+            time.sleep(interval)
+            t = requests.post(f"{self.authority}/token", data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": self.client_id,
+                "device_code": r["device_code"],
+            }, timeout=30).json()
+            if "access_token" in t:
+                self._save(t)
+                return self._username_from_id_token(t.get("id_token"))
+            err = t.get("error")
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                interval += 5
+                continue
+            raise SystemExit(f"Login failed: {t.get('error_description', t)}")
+
+    @staticmethod
+    def _username_from_id_token(id_token):
+        if not id_token:
+            return None
+        try:
+            payload = id_token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            return claims.get("preferred_username") or claims.get("email") or claims.get("upn")
+        except Exception:
+            return None
+
+    def token(self):
+        with self._lock:
+            tok = self._load()
+            if not tok:
+                raise RuntimeError("no saved token: run 'm365-mail-notify login'")
+            if tok["expires_at"] - 120 > time.time():
+                return tok["access_token"]
+            t = requests.post(f"{self.authority}/token", data={
+                "grant_type": "refresh_token",
+                "client_id": self.client_id,
+                "refresh_token": tok["refresh_token"],
+                "scope": self.scope,
+            }, timeout=30).json()
+            if "access_token" not in t:
+                raise RuntimeError(f"token refresh failed: {t.get('error_description', t)}")
+            if not t.get("refresh_token"):
+                t["refresh_token"] = tok["refresh_token"]
+            return self._save(t)["access_token"]
+
+
+# ---------------------------------------------------------------- notifications
+
+_active = []  # keeps notifications alive until they are closed
+
+
+def _open_outlook(*_):
+    subprocess.Popen(["xdg-open", OUTLOOK_URL], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def notify(sender, subject, icon="mail-unread"):
+    n = Notify.Notification.new(f"New email from {sender}", subject or "(no subject)", icon)
+    n.set_category("email.arrived")
+    n.set_hint("desktop-entry", GLib.Variant("s", APP))
+    n.add_action("default", "Open Outlook", _open_outlook)
+    n.connect("closed", lambda x: _active.remove(x) if x in _active else None)
+    _active.append(n)
+    n.show()
+    return False  # for GLib.idle_add
+
+
+def notify_from_thread(sender, subject):
+    GLib.idle_add(notify, sender, subject)
+
+
+def decode_header(value):
+    if not value:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(value))).strip()
+    except Exception:
+        return value.strip()
+
+
+def pretty_sender(from_header):
+    name, addr = email.utils.parseaddr(decode_header(from_header))
+    return name or addr or "unknown sender"
+
+
+# ---------------------------------------------------------------- IMAP IDLE backend
+
+class ImapWatcher:
+    IDLE_RENEW = 25 * 60  # Exchange drops IDLE connections after ~30 minutes
+
+    def __init__(self, auth, user, on_new):
+        self.auth, self.user, self.on_new = auth, user, on_new
+
+    def run_forever(self):
+        delay = 15
+        while True:
+            try:
+                self._session()
+                delay = 15
+            except (imaplib.IMAP4.error, OSError, ssl.SSLError, RuntimeError) as e:
+                log(f"IMAP: {e} - reconnecting in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+
+    def _session(self):
+        token = self.auth.token()
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, 993, timeout=60)
+        conn.authenticate("XOAUTH2", lambda _: f"user={self.user}\x01auth=Bearer {token}\x01\x01".encode())
+        conn.select("INBOX", readonly=True)
+        typ, data = conn.response("UIDNEXT")
+        if data and data[0]:
+            last_uid = int(data[0]) - 1
+        else:
+            typ, data = conn.status("INBOX", "(UIDNEXT)")
+            last_uid = int(re.search(rb"UIDNEXT (\d+)", data[0]).group(1)) - 1
+        log(f"IMAP connected as {self.user}, listening (last UID {last_uid})")
+        while True:
+            self._idle(conn)
+            typ, data = conn.uid("SEARCH", None, f"UID {last_uid + 1}:*")
+            uids = sorted(int(u) for u in (data[0].split() if data and data[0] else []) if int(u) > last_uid)
+            for uid in uids:
+                typ, fd = conn.uid("FETCH", str(uid), "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+                raw = b"".join(p[1] for p in fd if isinstance(p, tuple))
+                msg = email.message_from_bytes(raw)
+                self.on_new(pretty_sender(msg.get("From")), decode_header(msg.get("Subject")))
+                last_uid = uid
+
+    def _idle(self, conn):
+        tag = conn._new_tag()
+        conn.send(tag + b" IDLE\r\n")
+        resp = conn.readline()
+        if not resp.startswith(b"+"):
+            raise imaplib.IMAP4.error(f"IDLE rejected: {resp!r}")
+        conn.sock.settimeout(self.IDLE_RENEW)
+        try:
+            while True:
+                try:
+                    line = conn.readline()
+                except (socket.timeout, TimeoutError):
+                    break
+                if not line:
+                    raise imaplib.IMAP4.abort("connection closed by server")
+                if re.match(rb"\* \d+ (EXISTS|RECENT)", line):
+                    break
+        finally:
+            conn.sock.settimeout(60)
+            conn.send(b"DONE\r\n")
+            while True:
+                line = conn.readline()
+                if not line or line.startswith(tag):
+                    break
+
+
+# ---------------------------------------------------------------- Graph backend (polling)
+
+class GraphWatcher:
+    def __init__(self, auth, on_new, interval):
+        self.auth, self.on_new, self.interval = auth, on_new, interval
+
+    def run_forever(self):
+        since = None
+        log(f"Graph: polling every {self.interval}s")
+        while True:
+            try:
+                params = {"$select": "from,subject,receivedDateTime", "$orderby": "receivedDateTime desc", "$top": "25"}
+                if since:
+                    params["$filter"] = f"receivedDateTime gt {since}"
+                r = requests.get(GRAPH_INBOX, params=params, timeout=30,
+                                 headers={"Authorization": f"Bearer {self.auth.token()}"})
+                r.raise_for_status()
+                msgs = r.json().get("value", [])
+                if since is not None:
+                    for m in reversed(msgs):
+                        f = (m.get("from") or {}).get("emailAddress") or {}
+                        self.on_new(f.get("name") or f.get("address") or "unknown sender", m.get("subject"))
+                if msgs:
+                    since = msgs[0]["receivedDateTime"]
+                elif since is None:
+                    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except Exception as e:
+                log(f"Graph: {e}")
+            time.sleep(self.interval)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_login(args):
+    old = load_config()
+    backend = args.backend or old.get("backend", "imap")
+    client_id = args.client_id or old.get("client_id")
+    tenant = args.tenant or old.get("tenant", "common")
+    auth = Auth(backend, client_id, tenant)
+    username = auth.device_login()
+    user = args.user or username or old.get("user")
+    while not user:
+        user = input("Mailbox email address: ").strip()
+    save_config({"backend": backend, "user": user, "poll_interval": args.interval,
+                 "client_id": client_id, "tenant": tenant})
+    print(f"Login successful for {user} (backend: {backend}).")
+    subprocess.run(["systemctl", "--user", "restart", f"{APP}.service"], check=False)
+    print("Service started. Logs: journalctl --user -fu " + APP)
+
+
+def cmd_logout(_args):
+    secret_clear("tokens")
+    subprocess.run(["systemctl", "--user", "stop", f"{APP}.service"], check=False)
+    print("Tokens removed and service stopped.")
+
+
+def cmd_test(_args):
+    Notify.init(APP)
+    loop = GLib.MainLoop()
+    notify("Jane Doe", "Test notification - click to open Outlook")
+    GLib.timeout_add_seconds(3, loop.quit)
+    loop.run()
+
+
+def cmd_run(_args):
+    cfg = load_config()
+    Notify.init(APP)
+    backend = cfg.get("backend", "imap")
+    auth = Auth(backend, cfg.get("client_id"), cfg.get("tenant", "common"))
+    if not cfg.get("user") or not auth.has_tokens():
+        log("no account configured: run 'm365-mail-notify login'")
+        n = Notify.Notification.new("Email notifications are not active",
+                                    "Run in a terminal:  m365-mail-notify login", "dialog-warning")
+        n.show()
+        time.sleep(2)
+        return 0
+
+    if backend == "imap":
+        watcher = ImapWatcher(auth, cfg["user"], notify_from_thread)
+    else:
+        watcher = GraphWatcher(auth, notify_from_thread, int(cfg.get("poll_interval", 60)))
+    threading.Thread(target=watcher.run_forever, daemon=True).start()
+
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, lambda *_: loop.quit() or True)
+    loop.run()
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog=APP, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("login", help="authenticate the Microsoft 365 account (device code flow)")
+    s.add_argument("--backend", choices=list(BACKENDS), help="imap (default) or graph")
+    s.add_argument("--user", help="mailbox email address (normally detected automatically)")
+    s.add_argument("--interval", type=int, default=60, help="seconds between polls (graph backend only)")
+    s.add_argument("--client-id", help="client ID of your own Entra app registration (see README)")
+    s.add_argument("--tenant", help="Entra tenant ID or domain (default: common)")
+    s.set_defaults(fn=cmd_login)
+    sub.add_parser("run", help="start the watcher").set_defaults(fn=cmd_run)
+    sub.add_parser("test", help="show a test notification").set_defaults(fn=cmd_test)
+    sub.add_parser("logout", help="remove tokens and stop the service").set_defaults(fn=cmd_logout)
+    args = p.parse_args()
+    sys.exit(args.fn(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Microsoft 365 Mail Notifications
+Comment=Desktop notification when new email arrives in the inbox
+Exec=m365-mail-notify run
+Icon=mail-unread
+NoDisplay=true
+Categories=Network;Email;
+X-GNOME-UsesNotifications=true

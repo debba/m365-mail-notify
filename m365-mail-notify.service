@@ -1,0 +1,13 @@
+[Unit]
+Description=Microsoft 365 new-mail notifications (GNOME)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/m365-mail-notify run
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=graphical-session.target
